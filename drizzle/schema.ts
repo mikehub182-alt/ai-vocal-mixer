@@ -26,3 +26,27 @@ export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 
 // TODO: Add your tables here
+
+export const masteringJobs = mysqlTable("mastering_jobs", {
+  id: varchar("id", { length: 36 }).primaryKey(),
+  userId: int("userId").notNull(),
+  status: mysqlEnum("status", ["pending", "uploading", "analyzing", "processing", "exporting", "done", "error"]).default("pending").notNull(),
+  stage: varchar("stage", { length: 128 }),
+  progress: int("progress").default(0),
+  sourceKey: text("sourceKey"),
+  sourceUrl: text("sourceUrl"),
+  sourceFilename: varchar("sourceFilename", { length: 255 }),
+  sourceMime: varchar("sourceMime", { length: 64 }),
+  outputWavKey: text("outputWavKey"),
+  outputWavUrl: text("outputWavUrl"),
+  outputMp3Key: text("outputMp3Key"),
+  outputMp3Url: text("outputMp3Url"),
+  mixSettings: text("mixSettings"),
+  analysisReport: text("analysisReport"),
+  errorMsg: text("errorMsg"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type MasteringJob = typeof masteringJobs.$inferSelect;
+export type InsertMasteringJob = typeof masteringJobs.$inferInsert;

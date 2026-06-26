@@ -1,0 +1,21 @@
+CREATE TABLE `mastering_jobs` (
+	`id` varchar(36) NOT NULL,
+	`userId` int NOT NULL,
+	`status` enum('pending','uploading','analyzing','processing','exporting','done','error') NOT NULL DEFAULT 'pending',
+	`stage` varchar(128),
+	`progress` int DEFAULT 0,
+	`sourceKey` text,
+	`sourceUrl` text,
+	`sourceFilename` varchar(255),
+	`sourceMime` varchar(64),
+	`outputWavKey` text,
+	`outputWavUrl` text,
+	`outputMp3Key` text,
+	`outputMp3Url` text,
+	`mixSettings` text,
+	`analysisReport` text,
+	`errorMsg` text,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	`updatedAt` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `mastering_jobs_id` PRIMARY KEY(`id`)
+);
