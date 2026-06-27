@@ -188,6 +188,7 @@ export async function runMasteringJob(
   sourceUrl: string,
   analysis?: Record<string, unknown>
 ): Promise<void> {
+  console.log(`[Mastering] Job ${jobId} started. Source URL: ${sourceUrl}`);
   const tmpDir = os.tmpdir();
   const configPath = path.join(tmpDir, `mastering_config_${jobId}.json`);
   const decisionsPath = path.join(tmpDir, `mastering_decisions_${jobId}.json`);
@@ -196,8 +197,10 @@ export async function runMasteringJob(
     // If we already have analysis, get AI decisions first
     let aiDecisions: Record<string, unknown> = {};
     if (analysis && Object.keys(analysis).length > 0) {
+      console.log(`[Mastering] Job ${jobId}: Getting AI decisions from analysis...`);
       await updateJob(jobId, { status: "analyzing", stage: "AI generating mix decisions", progress: 35 });
       aiDecisions = await getAIDecisions(analysis);
+      console.log(`[Mastering] Job ${jobId}: AI decisions received. Keys: ${Object.keys(aiDecisions).join(", ")}`);
       if (Object.keys(aiDecisions).length > 0) {
         fs.writeFileSync(decisionsPath, JSON.stringify(aiDecisions));
       }
@@ -212,26 +215,52 @@ export async function runMasteringJob(
     fs.writeFileSync(configPath, JSON.stringify(config));
 
     // Spawn Python worker
+    // Pass the correct storage base URL so Python worker can download files
+    // Use the preview URL if available, otherwise construct from request headers
+    const storageBaseUrl = process.env.PREVIEW_URL || `${process.env.PUBLIC_BASE_URL || "http://localhost:3000"}`;
+    
     const env = {
       ...process.env,
       PYTHONPATH: DSP_DIR,
       AI_DECISIONS_FILE: Object.keys(aiDecisions).length > 0 ? decisionsPath : "",
+      STORAGE_BASE_URL: storageBaseUrl,
     };
 
+    console.log(`[Mastering] Job ${jobId}: Spawning Python worker. Config: ${configPath}`);
     await new Promise<void>((resolve, reject) => {
       const worker = spawn("python3", [path.join(DSP_DIR, "worker.py"), configPath], {
         env,
         cwd: DSP_DIR,
       });
+      console.log(`[Mastering] Job ${jobId}: Python worker spawned (PID: ${worker.pid})`);
 
       let stderrBuf = "";
+      let resolved = false;
+      
+      // Timeout protection: kill worker if no progress for 5 minutes
+      const timeoutHandle = setTimeout(() => {
+        if (!resolved) {
+          console.error(`[Mastering] Job ${jobId}: Worker timeout - no progress for 300 seconds`);
+          worker.kill('SIGTERM');
+          resolved = true;
+          reject(new Error(`Worker timeout: no progress for 300 seconds. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
+        }
+      }, 300000); // 5 minutes
+      
+      const cleanup = () => {
+        clearTimeout(timeoutHandle);
+      };
 
       worker.stdout.on("data", async (chunk: Buffer) => {
+        if (resolved) return; // Ignore if already resolved
         const lines = chunk.toString().split("\n").filter(Boolean);
+        console.log(`[Mastering] Job ${jobId}: Received ${lines.length} lines from worker`);
         for (const line of lines) {
+          console.log(`[Mastering] Job ${jobId}: Worker output: ${line}`);
           try {
             const msg = JSON.parse(line);
             if (msg.type === "progress") {
+              console.log(`[Mastering] Job ${jobId}: Progress update - ${msg.stage} (${msg.progress}%)`);
               await updateJob(jobId, {
                 status: msg.progress < 100 ? "processing" : "exporting",
                 stage: msg.stage,
@@ -253,6 +282,10 @@ export async function runMasteringJob(
                 mixSettings: JSON.stringify(msg.data),
               }).catch(() => {});
             } else if (msg.type === "done") {
+              if (resolved) return; // Already resolved
+              resolved = true;
+              cleanup();
+              
               // Upload outputs to storage
               await updateJob(jobId, {
                 status: "exporting",
@@ -274,6 +307,10 @@ export async function runMasteringJob(
               });
               resolve();
             } else if (msg.type === "error") {
+              if (resolved) return; // Already resolved
+              resolved = true;
+              cleanup();
+              
               await updateJob(jobId, {
                 status: "error",
                 stage: "Failed",
@@ -288,19 +325,67 @@ export async function runMasteringJob(
       });
 
       worker.stderr.on("data", (chunk: Buffer) => {
-        stderrBuf += chunk.toString();
+        const err = chunk.toString();
+        console.error(`[Mastering] Job ${jobId}: Worker stderr: ${err}`);
+        stderrBuf += err;
+        // Reset timeout on any activity
+        clearTimeout(timeoutHandle);
+        if (!resolved) {
+          setTimeout(() => {
+            if (!resolved) {
+              console.error(`[Mastering] Job ${jobId}: Worker timeout - no progress for 300 seconds`);
+              worker.kill('SIGTERM');
+              resolved = true;
+              reject(new Error(`Worker timeout: no progress for 300 seconds. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
+            }
+          }, 300000);
+        }
       });
-
-      worker.on("close", (code) => {
-        if (code !== 0) {
-          reject(new Error(`Python worker exited with code ${code}: ${stderrBuf}`));
+      
+      worker.stdout.on("data", () => {
+        // Reset timeout on any stdout activity
+        clearTimeout(timeoutHandle);
+        if (!resolved) {
+          setTimeout(() => {
+            if (!resolved) {
+              console.error(`[Mastering] Job ${jobId}: Worker timeout - no progress for 300 seconds`);
+              worker.kill('SIGTERM');
+              resolved = true;
+              reject(new Error(`Worker timeout: no progress for 300 seconds. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
+            }
+          }, 300000);
         }
       });
 
-      worker.on("error", reject);
+      worker.on("close", (code) => {
+        console.log(`[Mastering] Job ${jobId}: Worker exited with code ${code}`);
+        cleanup();
+        if (!resolved) {
+          if (code !== 0) {
+            console.error(`[Mastering] Job ${jobId}: Worker error output:\n${stderrBuf}`);
+            resolved = true;
+            reject(new Error(`Python worker exited with code ${code}: ${stderrBuf}`));
+          } else {
+            // Worker exited cleanly but didn't send done message - still an error
+            console.error(`[Mastering] Job ${jobId}: Worker exited without sending done message`);
+            resolved = true;
+            reject(new Error(`Worker exited without completion message. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
+          }
+        }
+      });
+
+      worker.on("error", (err) => {
+        console.error(`[Mastering] Job ${jobId}: Worker spawn error:`, err);
+        cleanup();
+        if (!resolved) {
+          resolved = true;
+          reject(err);
+        }
+      });
     });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[Mastering] Job ${jobId}: Error occurred:`, errMsg);
     await updateJob(jobId, {
       status: "error",
       stage: "Failed",

@@ -57,14 +57,19 @@ export const masteringRouter = router({
       }
 
       const jobId = nanoid();
+      console.log(`[Mastering] Upload: New job ID: ${jobId}, filename: ${input.filename}, size: ${input.fileSizeBytes} bytes`);
       const ext = input.filename.split(".").pop()?.toLowerCase() || "wav";
       const sourceKey = `uploads/${jobId}/source.${ext}`;
 
       // Decode base64 and upload to storage
+      console.log(`[Mastering] Upload: Decoding base64...`);
       const fileBuffer = Buffer.from(input.fileDataBase64, "base64");
+      console.log(`[Mastering] Upload: Buffer created (${fileBuffer.length} bytes). Uploading to storage...`);
       const { url: sourceUrl } = await storagePut(sourceKey, fileBuffer, normalizedMime);
+      console.log(`[Mastering] Upload: File uploaded. Source URL: ${sourceUrl}`);
 
       // Create job record
+      console.log(`[Mastering] Upload: Creating job record...`);
       await createJob({
         id: jobId,
         userId: ctx.user.id,
@@ -76,17 +81,24 @@ export const masteringRouter = router({
         sourceFilename: input.filename,
         sourceMime: normalizedMime,
       });
+      console.log(`[Mastering] Upload: Job record created.`);
 
       // Kick off background processing (fire and forget)
+      console.log(`[Mastering] Upload: Scheduling background job...`);
       setImmediate(async () => {
+        console.log(`[Mastering] Job ${jobId}: Background job started`);
         try {
+          console.log(`[Mastering] Job ${jobId}: Updating status to analyzing...`);
           await updateJob(jobId, { status: "analyzing", stage: "Analyzing audio", progress: 20 });
+          console.log(`[Mastering] Job ${jobId}: Calling runMasteringJob...`);
           await runMasteringJob(jobId, sourceUrl);
+          console.log(`[Mastering] Job ${jobId}: Background job completed successfully`);
         } catch (err) {
           console.error(`[Mastering] Job ${jobId} failed:`, err);
         }
       });
 
+      console.log(`[Mastering] Upload: Returning jobId ${jobId} to frontend`);
       return { jobId, status: "uploading" };
     }),
 
