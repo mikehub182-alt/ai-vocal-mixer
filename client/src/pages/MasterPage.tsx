@@ -50,10 +50,14 @@ export default function MasterPage() {
 
   const uploadMutation = trpc.mastering.upload.useMutation({
     onSuccess: (data) => {
+      console.log(`[Upload] Success! Job ID: ${data.jobId}`);
       toast.success("Upload complete! Processing started.");
+      // Reset progress and navigate to job page
+      setUploadProgress(0);
       navigate(`/job/${data.jobId}`);
     },
     onError: (err) => {
+      console.error(`[Upload] Error:`, err);
       toast.error(err.message || "Upload failed");
       setUploadProgress(0);
     },
@@ -90,11 +94,14 @@ export default function MasterPage() {
 
   const handleUpload = useCallback(async () => {
     if (!selectedFile) return;
+    console.log(`[Upload] Starting upload for ${selectedFile.name}`);
     setUploadProgress(10);
 
     try {
+      console.log(`[Upload] Reading file to base64...`);
       const base64 = await fileToBase64(selectedFile);
       setUploadProgress(40);
+      console.log(`[Upload] Base64 ready (${base64.length} chars). Sending to backend...`);
 
       await uploadMutation.mutateAsync({
         filename: selectedFile.name,
@@ -102,8 +109,13 @@ export default function MasterPage() {
         fileDataBase64: base64,
         fileSizeBytes: selectedFile.size,
       });
-    } catch {
+
+      // Upload complete, set to 100% before navigating
+      console.log(`[Upload] Mutation succeeded, setting progress to 100%`);
+      setUploadProgress(100);
+    } catch (err) {
       // error handled by onError
+      console.error("[Upload] Error:", err);
     }
   }, [selectedFile, uploadMutation]);
 
@@ -128,7 +140,7 @@ export default function MasterPage() {
     );
   }
 
-  const isUploading = uploadMutation.isPending || uploadProgress > 0;
+  const isUploading = uploadMutation.isPending || (uploadProgress > 0 && uploadProgress < 100);
 
   return (
     <AppShell>
@@ -216,17 +228,35 @@ export default function MasterPage() {
           </div>
         )}
 
-        {/* Upload progress */}
-        {isUploading && (
+        {/* Upload progress - in progress */}
+        {uploadProgress > 0 && uploadProgress < 100 && (
           <div className="mt-6">
             <div className="flex items-center justify-between text-sm mb-2">
-              <span className="text-muted-foreground">Uploading…</span>
+              <span className="text-muted-foreground">
+                {uploadProgress < 40 ? "Reading file…" : "Uploading…"}
+              </span>
               <span className="text-primary font-medium">{uploadProgress}%</span>
             </div>
             <div className="h-2 rounded-full bg-muted overflow-hidden">
               <div
                 className="h-full rounded-full bg-primary transition-all duration-500"
                 style={{ width: `${uploadProgress}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Upload complete */}
+        {uploadProgress === 100 && (
+          <div className="mt-6">
+            <div className="flex items-center justify-between text-sm mb-2">
+              <span className="text-muted-foreground">Upload complete! Redirecting…</span>
+              <span className="text-primary font-medium">100%</span>
+            </div>
+            <div className="h-2 rounded-full bg-muted overflow-hidden">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-500"
+                style={{ width: "100%" }}
               />
             </div>
           </div>
