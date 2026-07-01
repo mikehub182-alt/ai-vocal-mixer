@@ -1,401 +1,78 @@
 /**
  * masteringRunner.ts
- * Spawns the Python DSP worker as a child process, streams progress updates
- * back to the DB, and handles LLM-based AI decisions.
+ * Orchestrates mastering jobs using Node.js DSP modules (no subprocess spawning)
+ * Streams progress updates back to the DB
  */
-import { spawn } from "child_process";
+
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { invokeLLM } from "./_core/llm";
-import { storagePut } from "./storage";
 import { updateJob } from "./masteringDb";
+import { runMastering } from "./dsp/mastering";
 
-const DSP_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), "dsp");
+const TEMP_BASE = os.tmpdir();
 
-// ------------------------------------------------------------------ //
-// LLM-based AI decisions                                               //
-// ------------------------------------------------------------------ //
-
-export async function getAIDecisions(analysis: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const systemPrompt = `You are a professional audio mastering engineer AI. 
-Analyze the provided audio analysis data and return a JSON mixing/mastering settings object.
-You MUST return ONLY valid JSON with this exact structure:
-{
-  "eq": {
-    "highpass_hz": <number 60-120>,
-    "lowpass_hz": <number 16000-20000>,
-    "low_shelf": {"freq": <number>, "gain_db": <-3 to 3>, "q": 0.707},
-    "high_shelf": {"freq": <number>, "gain_db": <-3 to 4>, "q": 0.707},
-    "peak_bands": [
-      {"freq": <number>, "gain_db": <-6 to 6>, "q": <0.5-3>, "label": "<string>"}
-    ]
-  },
-  "compression": {
-    "threshold_db": <-30 to -8>,
-    "ratio": <1.5 to 8>,
-    "attack_ms": <1 to 50>,
-    "release_ms": <50 to 500>,
-    "makeup_gain_db": <0 to 6>
-  },
-  "reverb": {
-    "room_size": <0 to 0.5>,
-    "damping": <0.3 to 0.8>,
-    "wet_level": <0 to 0.15>,
-    "dry_level": <0.85 to 1.0>,
-    "width": <0.2 to 0.8>
-  },
-  "stereo": {"width_factor": <0.8 to 1.4>},
-  "lufs_target": <-16 to -9>,
-  "reasoning": {
-    "voice_type": "<bass|baritone|tenor|alto|mezzo|soprano>",
-    "genre_detected": "<string>",
-    "key_decisions": ["<string>", ...]
-  }
-}`;
-
-  const userPrompt = `Audio Analysis Report:
-${JSON.stringify(analysis, null, 2)}
-
-Based on this analysis, provide professional mastering settings. 
-Consider: voice type, dynamic range (crest factor), spectral balance, detected problems, and LUFS.
-Target -14 LUFS for streaming. Be precise and musical.`;
-
-  try {
-    const response = await invokeLLM({
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "mastering_settings",
-          strict: true,
-          schema: {
-            type: "object",
-            properties: {
-              eq: {
-                type: "object",
-                properties: {
-                  highpass_hz: { type: "number" },
-                  lowpass_hz: { type: "number" },
-                  low_shelf: {
-                    type: "object",
-                    properties: {
-                      freq: { type: "number" },
-                      gain_db: { type: "number" },
-                      q: { type: "number" },
-                    },
-                    required: ["freq", "gain_db", "q"],
-                    additionalProperties: false,
-                  },
-                  high_shelf: {
-                    type: "object",
-                    properties: {
-                      freq: { type: "number" },
-                      gain_db: { type: "number" },
-                      q: { type: "number" },
-                    },
-                    required: ["freq", "gain_db", "q"],
-                    additionalProperties: false,
-                  },
-                  peak_bands: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      properties: {
-                        freq: { type: "number" },
-                        gain_db: { type: "number" },
-                        q: { type: "number" },
-                        label: { type: "string" },
-                      },
-                      required: ["freq", "gain_db", "q", "label"],
-                      additionalProperties: false,
-                    },
-                  },
-                },
-                required: ["highpass_hz", "lowpass_hz", "low_shelf", "high_shelf", "peak_bands"],
-                additionalProperties: false,
-              },
-              compression: {
-                type: "object",
-                properties: {
-                  threshold_db: { type: "number" },
-                  ratio: { type: "number" },
-                  attack_ms: { type: "number" },
-                  release_ms: { type: "number" },
-                  makeup_gain_db: { type: "number" },
-                },
-                required: ["threshold_db", "ratio", "attack_ms", "release_ms", "makeup_gain_db"],
-                additionalProperties: false,
-              },
-              reverb: {
-                type: "object",
-                properties: {
-                  room_size: { type: "number" },
-                  damping: { type: "number" },
-                  wet_level: { type: "number" },
-                  dry_level: { type: "number" },
-                  width: { type: "number" },
-                },
-                required: ["room_size", "damping", "wet_level", "dry_level", "width"],
-                additionalProperties: false,
-              },
-              stereo: {
-                type: "object",
-                properties: { width_factor: { type: "number" } },
-                required: ["width_factor"],
-                additionalProperties: false,
-              },
-              lufs_target: { type: "number" },
-              reasoning: {
-                type: "object",
-                properties: {
-                  voice_type: { type: "string" },
-                  genre_detected: { type: "string" },
-                  key_decisions: { type: "array", items: { type: "string" } },
-                },
-                required: ["voice_type", "genre_detected", "key_decisions"],
-                additionalProperties: false,
-              },
-            },
-            required: ["eq", "compression", "reverb", "stereo", "lufs_target", "reasoning"],
-            additionalProperties: false,
-          },
-        },
-      },
-    });
-
-    const content = response.choices?.[0]?.message?.content;
-    if (content && typeof content === "string") {
-      return JSON.parse(content);
-    }
-  } catch (err) {
-    console.warn("[AI Decisions] LLM call failed, using rule-based fallback:", err);
-  }
-
-  // Fallback: rule-based (will be handled by Python worker)
-  return {};
-}
-
-// ------------------------------------------------------------------ //
-// Main runner                                                          //
-// ------------------------------------------------------------------ //
-
+/**
+ * Run mastering job for a given source URL
+ * Orchestrates: download → analyze → AI decisions → DSP → export → upload
+ */
 export async function runMasteringJob(
   jobId: string,
   sourceUrl: string,
-  analysis?: Record<string, unknown>
+  storageBaseUrl: string,
+  userId: number
 ): Promise<void> {
-  console.log(`[Mastering] Job ${jobId} started. Source URL: ${sourceUrl}`);
-  const tmpDir = os.tmpdir();
-  const configPath = path.join(tmpDir, `mastering_config_${jobId}.json`);
-  const decisionsPath = path.join(tmpDir, `mastering_decisions_${jobId}.json`);
+  console.log(`[MasteringRunner] Job ${jobId} started. Source URL: ${sourceUrl}`);
+
+  const tempDir = path.join(TEMP_BASE, `mastering_${jobId}`);
+
+  // Create temp directory
+  fs.mkdirSync(tempDir, { recursive: true });
 
   try {
-    // If we already have analysis, get AI decisions first
-    let aiDecisions: Record<string, unknown> = {};
-    if (analysis && Object.keys(analysis).length > 0) {
-      console.log(`[Mastering] Job ${jobId}: Getting AI decisions from analysis...`);
-      await updateJob(jobId, { status: "analyzing", stage: "AI generating mix decisions", progress: 35 });
-      aiDecisions = await getAIDecisions(analysis);
-      console.log(`[Mastering] Job ${jobId}: AI decisions received. Keys: ${Object.keys(aiDecisions).join(", ")}`);
-      if (Object.keys(aiDecisions).length > 0) {
-        fs.writeFileSync(decisionsPath, JSON.stringify(aiDecisions));
-      }
-    }
-
-    // Write config for Python worker
-    const config = {
-      job_id: jobId,
-      source_url: sourceUrl,
-      output_base_key: `outputs/${jobId}`,
-    };
-    fs.writeFileSync(configPath, JSON.stringify(config));
-
-    // Spawn Python worker
-    // Pass the correct storage base URL so Python worker can download files
-    // Use the preview URL if available, otherwise construct from request headers
-    const storageBaseUrl = process.env.PREVIEW_URL || `${process.env.PUBLIC_BASE_URL || "http://localhost:3000"}`;
-    
-    const env = {
-      ...process.env,
-      PYTHONPATH: DSP_DIR,
-      AI_DECISIONS_FILE: Object.keys(aiDecisions).length > 0 ? decisionsPath : "",
-      STORAGE_BASE_URL: storageBaseUrl,
-    };
-
-    console.log(`[Mastering] Job ${jobId}: Spawning Python worker. Config: ${configPath}`);
-    await new Promise<void>((resolve, reject) => {
-      const worker = spawn("python3", [path.join(DSP_DIR, "worker.py"), configPath], {
-        env,
-        cwd: DSP_DIR,
-      });
-      console.log(`[Mastering] Job ${jobId}: Python worker spawned (PID: ${worker.pid})`);
-
-      let stderrBuf = "";
-      let resolved = false;
-      
-      // Timeout protection: kill worker if no progress for 5 minutes
-      const timeoutHandle = setTimeout(() => {
-        if (!resolved) {
-          console.error(`[Mastering] Job ${jobId}: Worker timeout - no progress for 300 seconds`);
-          worker.kill('SIGTERM');
-          resolved = true;
-          reject(new Error(`Worker timeout: no progress for 300 seconds. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
-        }
-      }, 300000); // 5 minutes
-      
-      const cleanup = () => {
-        clearTimeout(timeoutHandle);
-      };
-
-      worker.stdout.on("data", async (chunk: Buffer) => {
-        if (resolved) return; // Ignore if already resolved
-        const lines = chunk.toString().split("\n").filter(Boolean);
-        console.log(`[Mastering] Job ${jobId}: Received ${lines.length} lines from worker`);
-        for (const line of lines) {
-          console.log(`[Mastering] Job ${jobId}: Worker output: ${line}`);
-          try {
-            const msg = JSON.parse(line);
-            if (msg.type === "progress") {
-              console.log(`[Mastering] Job ${jobId}: Progress update - ${msg.stage} (${msg.progress}%)`);
-              await updateJob(jobId, {
-                status: msg.progress < 100 ? "processing" : "exporting",
-                stage: msg.stage,
-                progress: msg.progress,
-              }).catch(() => {});
-            } else if (msg.type === "analysis") {
-              // Analysis done, get AI decisions now if not already done
-              if (Object.keys(aiDecisions).length === 0) {
-                await updateJob(jobId, { status: "analyzing", stage: "AI generating mix decisions", progress: 38 });
-                aiDecisions = await getAIDecisions(msg.data);
-                if (Object.keys(aiDecisions).length > 0) {
-                  fs.writeFileSync(decisionsPath, JSON.stringify(aiDecisions));
-                  // Restart won't work mid-flight, decisions file will be used if worker re-reads it
-                }
-              }
-            } else if (msg.type === "decisions") {
-              // Store decisions in DB
-              await updateJob(jobId, {
-                mixSettings: JSON.stringify(msg.data),
-              }).catch(() => {});
-            } else if (msg.type === "done") {
-              if (resolved) return; // Already resolved
-              resolved = true;
-              cleanup();
-              
-              // Upload outputs to storage
-              await updateJob(jobId, {
-                status: "exporting",
-                stage: "Uploading to cloud storage",
-                progress: 90,
-              });
-
-              // The Python worker already uploaded; store the keys/URLs
-              await updateJob(jobId, {
-                status: "done",
-                stage: "Complete",
-                progress: 100,
-                outputWavKey: msg.wav_key,
-                outputWavUrl: msg.wav_url,
-                outputMp3Key: msg.mp3_key,
-                outputMp3Url: msg.mp3_url,
-                analysisReport: JSON.stringify(msg.analysis),
-                mixSettings: JSON.stringify(msg.mix_settings),
-              });
-              resolve();
-            } else if (msg.type === "error") {
-              if (resolved) return; // Already resolved
-              resolved = true;
-              cleanup();
-              
-              await updateJob(jobId, {
-                status: "error",
-                stage: "Failed",
-                errorMsg: msg.message,
-              }).catch(() => {});
-              reject(new Error(msg.message));
-            }
-          } catch {
-            // Non-JSON line, ignore
-          }
-        }
-      });
-
-      worker.stderr.on("data", (chunk: Buffer) => {
-        const err = chunk.toString();
-        console.error(`[Mastering] Job ${jobId}: Worker stderr: ${err}`);
-        stderrBuf += err;
-        // Reset timeout on any activity
-        clearTimeout(timeoutHandle);
-        if (!resolved) {
-          setTimeout(() => {
-            if (!resolved) {
-              console.error(`[Mastering] Job ${jobId}: Worker timeout - no progress for 300 seconds`);
-              worker.kill('SIGTERM');
-              resolved = true;
-              reject(new Error(`Worker timeout: no progress for 300 seconds. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
-            }
-          }, 300000);
-        }
-      });
-      
-      worker.stdout.on("data", () => {
-        // Reset timeout on any stdout activity
-        clearTimeout(timeoutHandle);
-        if (!resolved) {
-          setTimeout(() => {
-            if (!resolved) {
-              console.error(`[Mastering] Job ${jobId}: Worker timeout - no progress for 300 seconds`);
-              worker.kill('SIGTERM');
-              resolved = true;
-              reject(new Error(`Worker timeout: no progress for 300 seconds. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
-            }
-          }, 300000);
-        }
-      });
-
-      worker.on("close", (code) => {
-        console.log(`[Mastering] Job ${jobId}: Worker exited with code ${code}`);
-        cleanup();
-        if (!resolved) {
-          if (code !== 0) {
-            console.error(`[Mastering] Job ${jobId}: Worker error output:\n${stderrBuf}`);
-            resolved = true;
-            reject(new Error(`Python worker exited with code ${code}: ${stderrBuf}`));
-          } else {
-            // Worker exited cleanly but didn't send done message - still an error
-            console.error(`[Mastering] Job ${jobId}: Worker exited without sending done message`);
-            resolved = true;
-            reject(new Error(`Worker exited without completion message. Last stderr: ${stderrBuf.slice(-500)}`.trim()));
-          }
-        }
-      });
-
-      worker.on("error", (err) => {
-        console.error(`[Mastering] Job ${jobId}: Worker spawn error:`, err);
-        cleanup();
-        if (!resolved) {
-          resolved = true;
-          reject(err);
-        }
-      });
+    // Update job status to analyzing
+    await updateJob(jobId, {
+      status: "analyzing",
+      stage: "Downloading and analyzing audio",
     });
+
+    // Run mastering process
+    console.log(`[MasteringRunner] Job ${jobId}: Starting mastering process`);
+    const result = await runMastering(jobId, sourceUrl, tempDir, userId);
+
+    // Update job with final results
+    if (result.status === "success") {
+      await updateJob(jobId, {
+        status: "done",
+        stage: "Complete",
+        outputWavUrl: result.wavUrl || "",
+        outputMp3Url: result.mp3Url || "",
+        analysisReport: JSON.stringify(result.analysis || {}),
+        mixSettings: JSON.stringify(result.mixSettings || {}),
+      });
+      console.log(`[MasteringRunner] Job ${jobId}: Mastering completed successfully`);
+    } else {
+      await updateJob(jobId, {
+        status: "error",
+        stage: `Error: ${result.error}`,
+        errorMsg: result.error || "Unknown error",
+      });
+      console.error(`[MasteringRunner] Job ${jobId}: Mastering failed: ${result.error}`);
+    }
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    console.error(`[Mastering] Job ${jobId}: Error occurred:`, errMsg);
+    const errorMsg = String(err);
+    console.error(`[MasteringRunner] Job ${jobId}: Unexpected error:`, err);
     await updateJob(jobId, {
       status: "error",
-      stage: "Failed",
-      errorMsg: errMsg,
-    }).catch(() => {});
-    throw err;
+      stage: `Error: ${errorMsg}`,
+      errorMsg: errorMsg,
+    });
   } finally {
     // Cleanup temp files
-    [configPath, decisionsPath].forEach((f) => {
-      try { fs.unlinkSync(f); } catch { /* ignore */ }
-    });
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch (err) {
+      console.warn(`[MasteringRunner] Failed to cleanup temp dir:`, err);
+    }
   }
 }

@@ -91,7 +91,7 @@ export const masteringRouter = router({
           console.log(`[Mastering] Job ${jobId}: Updating status to analyzing...`);
           await updateJob(jobId, { status: "analyzing", stage: "Analyzing audio", progress: 20 });
           console.log(`[Mastering] Job ${jobId}: Calling runMasteringJob...`);
-          await runMasteringJob(jobId, sourceUrl);
+          await runMasteringJob(jobId, sourceUrl, process.env.VITE_FRONTEND_FORGE_API_URL || "", ctx.user.id);
           console.log(`[Mastering] Job ${jobId}: Background job completed successfully`);
         } catch (err) {
           console.error(`[Mastering] Job ${jobId} failed:`, err);

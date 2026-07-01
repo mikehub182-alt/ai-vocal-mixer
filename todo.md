@@ -33,3 +33,14 @@
 - [x] Vitest: upload validation
 - [x] Screenshot verification
 - [x] Checkpoint save
+
+
+## Phase 6: Node.js DSP Rewrite (Autoscale Compatibility)
+- [x] Install Node.js audio packages (ffmpeg-static, fluent-ffmpeg, music-metadata)
+- [x] server/dsp/analyze.ts — WAV parsing, RMS, LUFS estimation, spectral centroid, voice type detection
+- [x] server/dsp/process.ts — FFmpeg filter chains (EQ, compression, reverb, limiter, loudness normalization)
+- [x] server/dsp/mastering.ts — orchestrator: download → analyze → AI → DSP → export → upload
+- [x] server/masteringRunner.ts — call Node.js DSP directly (no subprocess spawning)
+- [x] Remove Python subprocess dependencies (no spawn, no ENOENT errors)
+- [x] TypeScript compilation clean (no errors)
+- [x] Dev server running and UI accessible
